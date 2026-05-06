@@ -1,5 +1,7 @@
 # mini-httpd
 
+[English](./README.md) | [中文](./README.zh.md)
+
 A lightweight HTTP server with shell script execution support.
 
 ## Quick Start
