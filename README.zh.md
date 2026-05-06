@@ -59,7 +59,6 @@ echo "Path: $__path"
 cat  # echo stdin
 ```
 ```bash
-chmod +x hello.sh
 curl http://localhost:8080/exec/hello
 ```
 
