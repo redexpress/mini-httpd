@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build main project
+        run: cmake . && make
+
+      - name: Configure tests
+        run: cmake -B build_tests -S tests -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build tests
+        run: cmake --build build_tests
+
+      - name: Run tests
+        run: ctest --test-dir build_tests --output-on-failure
