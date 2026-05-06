@@ -48,18 +48,16 @@ See `sample.sh` for a reference implementation that parses the request format.
 
 **Example:**
 
-```bash
-# Create a script
-cat > hello.sh << 'EOF'
+Create `hello.sh`:
+```sh
 #!/bin/sh
 echo "Hello from shell!"
 echo "Method: $__method"
 echo "Path: $__path"
 cat  # echo stdin
-EOF
+```
+```bash
 chmod +x hello.sh
-
-# Run it via HTTP
 curl http://localhost:8080/exec/hello
 ```
 
@@ -67,4 +65,4 @@ curl http://localhost:8080/exec/hello
 
 - POSIX system (Linux, macOS, WSL)
 - GCC or Clang
-- CMake 3.10+
+- CMake 3.14+
