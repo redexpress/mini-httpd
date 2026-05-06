@@ -58,9 +58,7 @@ echo "Method: $__method"
 echo "Path: $__path"
 cat  # echo stdin
 ```
-```bash
-curl http://localhost:8080/exec/hello
-```
+Then call it with `curl http://localhost:8080/exec/hello`
 
 ## Build Requirements
 

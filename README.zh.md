@@ -58,9 +58,7 @@ echo "Method: $__method"
 echo "Path: $__path"
 cat  # echo stdin
 ```
-```bash
-curl http://localhost:8080/exec/hello
-```
+然后用 `curl http://localhost:8080/exec/hello` 调用
 
 ## 构建要求
 
