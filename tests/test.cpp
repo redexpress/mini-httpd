@@ -4,6 +4,9 @@
 #include <vector>
 #include <tuple>
 
+#define _True 1
+#define _False 0
+
 // Test helpers - copied from main.c for unit testing
 int build_args_from_path(const char *path, char *out, int maxlen) {
     const char *q = strchr(path, '?');
@@ -84,19 +87,19 @@ TEST_CASE("build_args_from_path", "[helpers]") {
 
 TEST_CASE("path_match", "[helpers]") {
     SECTION("exact match") {
-        REQUIRE(path_match("/get", "/get") != 0);
+        REQUIRE(path_match("/get", "/get") != _False);
     }
 
     SECTION("with query string") {
-        REQUIRE(path_match("/get?foo=bar", "/get") != 0);
+        REQUIRE(path_match("/get?foo=bar", "/get") != _False);
     }
 
     SECTION("no match") {
-        REQUIRE(path_match("/post", "/get") == 0);
+        REQUIRE(path_match("/post", "/get") == _False);
     }
 
     SECTION("prefix no match") {
-        REQUIRE(path_match("/gets", "/get") == 0);
+        REQUIRE(path_match("/gets", "/get") == _False);
     }
 }
 

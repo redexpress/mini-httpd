@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -10,6 +11,45 @@
 
 #define PORT 8080
 #define BUF_SIZE 16384
+#define MAX_HEADERS 64
+#define MAX_HEADER_LEN 1024
+
+typedef struct {
+    char buf[BUF_SIZE];
+    int start;
+    int end;
+} stream_buf_t;
+
+static int fill_buf(int sock, stream_buf_t *stream_buf) {
+    if (stream_buf->start > 0) {
+        if (stream_buf->start < stream_buf->end)
+            memmove(stream_buf->buf, stream_buf->buf + stream_buf->start, stream_buf->end - stream_buf->start);
+        stream_buf->end -= stream_buf->start;
+        stream_buf->start = 0;
+    }
+
+    int n = recv(sock, stream_buf->buf + stream_buf->end, BUF_SIZE - stream_buf->end, 0);
+    if (n <= 0) return n;
+
+    stream_buf->end += n;
+    return n;
+}
+
+static int get_line(int sock, stream_buf_t *stream_buf, char *out, int size) {
+    int i = 0;
+
+    while (true) {
+        if (stream_buf->start >= stream_buf->end) {
+            int n = fill_buf(sock, stream_buf);
+            if (n <= 0) return n;
+        }
+        char c = stream_buf->buf[stream_buf->start++];
+        if (i < size - 1) out[i++] = c;
+        if (c == '\n') break;
+    }
+    out[i] = '\0';
+    return i;
+}
 
 static void get_path(const char *buf, char *path, size_t n) {
     const char *p = buf;
@@ -42,7 +82,7 @@ int build_args_from_path(const char *path, char *out, int maxlen) {
         return len;
     }
     q++;
-    int first = 1;
+    bool first = true;
     while (*q) {
         char key[256] = {0};
         char val[256] = {0};
@@ -60,7 +100,7 @@ int build_args_from_path(const char *path, char *out, int maxlen) {
             val[i] = '\0';
         }
         if (!first) len += snprintf(out + len, maxlen - len, ", ");
-        first = 0;
+        first = false;
         len += snprintf(out + len, maxlen - len, "\"%s\": \"%s\"", key, val);
         if (*q == '&') q++;
     }
@@ -68,37 +108,39 @@ int build_args_from_path(const char *path, char *out, int maxlen) {
     return len;
 }
 
-int build_get(char *req, int header_end, char *out, int maxlen, const char *client_ip) {
-    char method[16], path[256], proto[16];
-    sscanf(req, "%15s %255s %15s", method, path, proto);
+static bool parse_header_line(const char *line, char *key, char *val) {
+    const char *c = strchr(line, ':');
+    if (!c) return false;
+    size_t key_len = c - line;
+    if (key_len > 255) key_len = 255;
+    memcpy(key, line, key_len);
+    key[key_len] = '\0';
+
+    c++;
+    while (*c == ' ') c++;
+    strncpy(val, c, 255);
+    val[255] = '\0';
+    return true;
+}
+
+int build_httpbin(const char *method, const char *path,
+                  char headers[][MAX_HEADER_LEN], int header_count,
+                  char *out, int maxlen, const char *client_ip) {
     char args_buf[512];
     build_args_from_path(path, args_buf, sizeof(args_buf));
     int len = 0;
     len += snprintf(out + len, maxlen - len, "{\n");
     len += snprintf(out + len, maxlen - len, "  \"args\": %s,\n", args_buf);
     len += snprintf(out + len, maxlen - len, "  \"headers\": {\n");
-    char *p = strstr(req, "\r\n");
-    if (!p) return 0;
-    p += 2;
-    int first = 1;
-    while (p && p < req + header_end - 2) {
-        char *e = strstr(p, "\r\n");
-        if (!e) break;
-        char tmp = *e;
-        *e = '\0';
-        char *c = strchr(p, ':');
-        if (c) {
-            *c = '\0';
-            char *key = p;
-            char *val = c + 1;
-            while (*val == ' ') val++;
+
+    bool first = true;
+    for (int i = 0; i < header_count; i++) {
+        char key[256] = {0}, val[256] = {0};
+        if (parse_header_line(headers[i], key, val)) {
             if (!first) len += snprintf(out + len, maxlen - len, ",\n");
-            first = 0;
+            first = false;
             len += snprintf(out + len, maxlen - len, "    \"%s\": \"%s\"", key, val);
-            *c = ':';
         }
-        *e = tmp;
-        p = e + 2;
     }
 
     len += snprintf(out + len, maxlen - len, "\n  },\n");
@@ -110,24 +152,30 @@ int build_get(char *req, int header_end, char *out, int maxlen, const char *clie
 }
 
 
-int build_post(char *req, int header_end, char *out, int maxlen, const char *client_ip) {
-    char method[16], path[256], proto[16];
-    sscanf(req, "%15s %255s %15s", method, path, proto);
-    char *body = req + header_end;
+int build_httpbin_post(const char *method, const char *path,
+                       char headers[][MAX_HEADER_LEN], int header_count,
+                       const char *body, int body_len,
+                       char *out, int maxlen, const char *client_ip) {
     char args_buf[512];
     build_args_from_path(path, args_buf, sizeof(args_buf));
     int len = 0;
     len += snprintf(out + len, maxlen - len, "{\n");
     len += snprintf(out + len, maxlen - len, "  \"args\": %s,\n", args_buf);
 
-    int is_json = 0;
-    char *ctype = strcasestr(req, "Content-Type:");
-    if (ctype && strstr(ctype, "application/json")) {
-        is_json = 1;
+    bool is_json = false;
+    for (int i = 0; i < header_count; i++) {
+        char key[256] = {0}, val[256] = {0};
+        if (parse_header_line(headers[i], key, val)) {
+            if (strcasecmp(key, "Content-Type") == 0) {
+                if (strstr(val, "application/json")) {
+                    is_json = true;
+                }
+            }
+        }
     }
 
-    if (is_json) {
-        len += snprintf(out + len, maxlen - len, "  \"data\": \"%s\",\n", body ? body : "");
+    if (is_json && body && body_len > 0) {
+        len += snprintf(out + len, maxlen - len, "  \"data\": \"%.*s\",\n", body_len, body);
     } else {
         len += snprintf(out + len, maxlen - len, "  \"data\": \"\",\n");
     }
@@ -135,46 +183,27 @@ int build_post(char *req, int header_end, char *out, int maxlen, const char *cli
     len += snprintf(out + len, maxlen - len, "  \"files\": {},\n");
     len += snprintf(out + len, maxlen - len, "  \"form\": {\n");
 
-    if (!is_json && body && *body) {
-        len += snprintf(out + len, maxlen - len, "    \"%s\": \"\"\n", body);
+    if (!is_json && body && body_len > 0) {
+        len += snprintf(out + len, maxlen - len, "    \"%.*s\": \"\"\n", body_len, body);
     }
 
     len += snprintf(out + len, maxlen - len, "  },\n");
     len += snprintf(out + len, maxlen - len, "  \"headers\": {\n");
 
-    char *p = strstr(req, "\r\n");
-    if (!p) return 0;
-    p += 2;
-
-    int first = 1;
-
-    while (p && p < req + header_end - 2) {
-        char *e = strstr(p, "\r\n");
-        if (!e) break;
-
-        char tmp = *e;
-        *e = '\0';
-
-        char *c = strchr(p, ':');
-        if (c) {
-            *c = '\0';
-            char *key = p;
-            char *val = c + 1;
-            while (*val == ' ') val++;
+    bool first = true;
+    for (int i = 0; i < header_count; i++) {
+        char key[256] = {0}, val[256] = {0};
+        if (parse_header_line(headers[i], key, val)) {
             if (!first) len += snprintf(out + len, maxlen - len, ",\n");
-            first = 0;
+            first = false;
             len += snprintf(out + len, maxlen - len, "    \"%s\": \"%s\"", key, val);
-            *c = ':';
         }
-
-        *e = tmp;
-        p = e + 2;
     }
 
     len += snprintf(out + len, maxlen - len, "\n  },\n");
 
-    if (is_json) {
-        len += snprintf(out + len, maxlen - len, "  \"json\": %s,\n", body ? body : "null");
+    if (is_json && body && body_len > 0) {
+        len += snprintf(out + len, maxlen - len, "  \"json\": %.*s,\n", body_len, body);
     } else {
         len += snprintf(out + len, maxlen - len, "  \"json\": null,\n");
     }
@@ -186,71 +215,59 @@ int build_post(char *req, int header_end, char *out, int maxlen, const char *cli
     return len;
 }
 
-int path_match(const char *path, const char *route) {
-    int n = strlen(route);
+bool path_match(const char *path, const char *route) {
+    size_t n = strlen(route);
     return strncmp(path, route, n) == 0 &&
            (path[n] == '\0' || path[n] == '?');
 }
 
-int build_script_input(char *req, int header_end, char *out, int maxlen) {
+int build_script_input(const char *method, const char *path, const char *proto,
+                       char headers[][MAX_HEADER_LEN], int header_count,
+                       const char *body, int body_len,
+                       char *out, int maxlen) {
     int len = 0;
-
-    char method[16], path[256], proto[16];
-    sscanf(req, "%15s %255s %15s", method, path, proto);
-
     len += snprintf(out + len, maxlen - len, "__method: %s\n", method);
     len += snprintf(out + len, maxlen - len, "__path: %s\n", path);
     len += snprintf(out + len, maxlen - len, "__proto: %s\n", proto);
-    // headers
-    char *p = strstr(req, "\r\n");
-    if (p) p += 2;
 
-    while (p && p < req + header_end - 2) {
-        char *e = strstr(p, "\r\n");
-        if (!e) break;
-        int l = e - p;
-        if (l <= 0) break;
-        char line[512];
-        if (l >= (int) sizeof(line)) l = sizeof(line) - 1;
-        memcpy(line, p, l);
-        line[l] = '\0';
-        len += snprintf(out + len, maxlen - len, "%s\n", line);
-        p = e + 2;
+    for (int i = 0; i < header_count; i++) {
+        len += snprintf(out + len, maxlen - len, "%s\n", headers[i]);
     }
-    // body
-    char *body = req + header_end;
+
     len += snprintf(out + len, maxlen - len, "__body: ");
-    if (body) {
-        int blen = strlen(body);
-        if (len + blen < maxlen) {
-            memcpy(out + len, body, blen);
-            len += blen;
+    if (body && body_len > 0) {
+        if (len + body_len < maxlen) {
+            memcpy(out + len, body, body_len);
+            len += body_len;
         }
     }
-
     len += snprintf(out + len, maxlen - len, "\n");
+
     return len;
 }
 
-int handle_exec(char *path, char *req, int header_end, char *body, int maxlen) {
-    char *cmd = path + 6;
+int handle_exec(const char *path, const char *method, const char *proto,
+                char headers[][MAX_HEADER_LEN], int header_count,
+                const char *body, int body_len,
+                char *body_out, int maxlen) {
+    const char *cmd = path + 6;
     if (!*cmd) {
-        return snprintf(body, maxlen, "exec: empty\n");
+        return snprintf(body_out, maxlen, "exec: empty\n");
     }
     char script[512];
     snprintf(script, sizeof(script), "./%s.sh", cmd);
     char input[BUF_SIZE];
-    int input_len = build_script_input(req, header_end, input, sizeof(input));
+    int input_len = build_script_input(method, path, proto, headers, header_count, body, body_len, input, sizeof(input));
 
     int inpipe[2], outpipe[2];
     if (pipe(inpipe) < 0 || pipe(outpipe) < 0) {
-        return snprintf(body, maxlen, "pipe error\n");
+        return snprintf(body_out, maxlen, "pipe error\n");
     }
 
     pid_t pid = fork();
 
     if (pid < 0) {
-        return snprintf(body, maxlen, "fork error\n");
+        return snprintf(body_out, maxlen, "fork error\n");
     }
 
     if (pid == 0) {
@@ -268,8 +285,8 @@ int handle_exec(char *path, char *req, int header_end, char *body, int maxlen) {
     write(inpipe[1], input, input_len);
     close(inpipe[1]);
     int total = 0;
-    while (1) {
-        int n = read(outpipe[0], body + total, maxlen - total);
+    while (true) {
+        int n = read(outpipe[0], body_out + total, maxlen - total);
         if (n > 0) {
             total += n;
             if (total >= maxlen) break;
@@ -282,7 +299,7 @@ int handle_exec(char *path, char *req, int header_end, char *body, int maxlen) {
     waitpid(pid, NULL, 0);
 
     if (total == 0) {
-        return snprintf(body, maxlen, "exec failed\n");
+        return snprintf(body_out, maxlen, "exec failed\n");
     }
 
     return total;
@@ -297,6 +314,9 @@ int main(int argc, char *argv[]) {
     
     int listenfd, connfd;
     struct sockaddr_in servaddr;
+    stream_buf_t stream_buf;
+    stream_buf.start = 0;
+    stream_buf.end = 0;
     listenfd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -313,109 +333,115 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     printf("server running on %d\n", port);
-    while (1) {
+    while (true) {
         connfd = accept(listenfd, NULL, NULL);
         if (connfd < 0) continue;
-        char buf[BUF_SIZE];
-        int total = 0;
-        int header_end = -1;
-        int content_length = 0;
-        while (1) {
-            if (total >= BUF_SIZE - 1) break;
-            int n = read(connfd, buf + total, BUF_SIZE - total - 1);
-            if (n > 0) {
-                total += n;
-                buf[total] = '\0';
-                if (header_end == -1) {
-                    for (int i = 0; i < total - 3; i++) {
-                        if (buf[i] == '\r' && buf[i + 1] == '\n' &&
-                            buf[i + 2] == '\r' && buf[i + 3] == '\n') {
-                            header_end = i + 4;
-                            break;
-                        }
-                    }
-                }
 
-                if (header_end != -1 && content_length == 0) {
-                    char *cl = strcasestr(buf, "Content-Length:");
-                    if (cl) content_length = atoi(cl + 15);
-                }
-
-                if (header_end != -1) {
-                    int expected = header_end + content_length;
-                    if (total >= expected) break;
-                }
-            } else if (n == 0) {
-                break;
-            } else {
-                if (errno == EINTR) continue;
-                break;
-            }
-        }
-
-        if (total <= 0) {
+        // request line
+        char req_line[MAX_HEADER_LEN];
+        int n = get_line(connfd, &stream_buf, req_line, sizeof(req_line));
+        if (n <= 0) {
             close(connfd);
             continue;
         }
 
-        char path[1024];
-        get_path(buf, path, sizeof(path));
+        // method and path
+        char method[32] = {0}, path[1024] = {0}, proto[32] = {0};
+        sscanf(req_line, "%31s %1023s %31s", method, path, proto);
+        get_path(req_line, path, sizeof(path));
 
-        char body[BUF_SIZE];
+        // header
+        char headers[MAX_HEADERS][MAX_HEADER_LEN];
+        int header_count = 0;
+        int content_length = 0;
+
+        while (header_count < MAX_HEADERS) {
+            char line[MAX_HEADER_LEN];
+            n = get_line(connfd, &stream_buf, line, sizeof(line));
+            if (n <= 0) break;
+
+            // empty line mark
+            if (n == 1 && line[0] == '\n') break;
+            if (n == 2 && strcmp(line, "\r\n") == 0) break;
+
+            // trim trailing \r\n
+            int len = n;
+            if (len >= 2 && line[len-2] == '\r') len -= 2;
+            else if (len >= 1 && line[len-1] == '\n') len--;
+            line[len] = '\0';
+
+            // Content-Length
+            if (strncasecmp(line, "Content-Length:", 15) == 0) {
+                content_length = atoi(line + 15);
+            }
+
+            // Store header line
+            if (len > 0 && header_count < MAX_HEADERS) {
+                strncpy(headers[header_count], line, MAX_HEADER_LEN - 1);
+                headers[header_count][MAX_HEADER_LEN - 1] = '\0';
+                header_count++;
+            }
+        }
+
+        // body
+        char body[BUF_SIZE] = {0};
         int body_len = 0;
+        if (content_length > 0 && content_length < BUF_SIZE) {
+            while (body_len < content_length) {
+                n = read(connfd, body + body_len, content_length - body_len);
+                if (n > 0) {
+                    body_len += n;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // client IP
+        struct sockaddr_in addr;
+        socklen_t addr_len = sizeof(addr);
+        char ip[64] = "unknown";
+        if (getpeername(connfd, (struct sockaddr *) &addr, &addr_len) == 0) {
+            inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+        }
+
+        char resp_body[BUF_SIZE];
+        int resp_body_len = 0;
+        const char *ctype = "text/plain";
 
         if (path_match(path, "/get")) {
-            struct sockaddr_in addr;
-            socklen_t len = sizeof(addr);
-
-            if (getpeername(connfd, (struct sockaddr *) &addr, &len) == 0) {
-                char ip[64];
-                inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
-                body_len = build_get(buf, header_end, body, sizeof(body), ip);
-            } else {
-                body_len = snprintf(body, sizeof(body), "{\"error\":\"getpeername failed\"}\n");
-            }
+            resp_body_len = build_httpbin(method, path, headers, header_count, resp_body, sizeof(resp_body), ip);
+            ctype = "application/json";
         } else if (path_match(path, "/post")) {
-            struct sockaddr_in addr;
-            socklen_t len = sizeof(addr);
-            getpeername(connfd, (struct sockaddr *) &addr, &len);
-            char ip[64];
-            inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
-            body_len = build_post(buf, header_end, body, sizeof(body), ip);
+            resp_body_len = build_httpbin_post(method, path, headers, header_count, body, body_len, resp_body, sizeof(resp_body), ip);
+            ctype = "application/json";
         } else if (path_match(path, "/raw")) {
-            body_len = build_raw_text(buf, total, body, sizeof(body));
+            resp_body_len = snprintf(resp_body, sizeof(resp_body), "%s %s %s\n", method, path, proto);
+            for (int i = 0; i < header_count; i++) {
+                resp_body_len += snprintf(resp_body + resp_body_len, sizeof(resp_body) - resp_body_len, "%s\n", headers[i]);
+            }
         } else if (strcmp(path, "/") == 0) {
-            body_len = snprintf(body, sizeof(body), "{}\n");
+            resp_body_len = snprintf(resp_body, sizeof(resp_body), "{}\n");
         } else if (strncmp(path, "/exec/", 6) == 0) {
-            body_len = handle_exec(path, buf, header_end, body, sizeof(body));
+            resp_body_len = handle_exec(path, method, proto, headers, header_count, body, body_len, resp_body, sizeof(resp_body));
         } else {
-            body_len = build_raw_text(buf, total, body, sizeof(body));
+            resp_body_len = snprintf(resp_body, sizeof(resp_body), "Not Found\n");
         }
 
-        if (body_len < 0) body_len = 0;
-        if (body_len > BUF_SIZE) body_len = BUF_SIZE;
+        if (resp_body_len < 0) resp_body_len = 0;
+        if (resp_body_len > BUF_SIZE) resp_body_len = BUF_SIZE;
 
         char resp[BUF_SIZE];
-        const char *ctype = "text/plain";
-        if (path_match(path, "/get") || path_match(path, "/post")) {
-            ctype = "application/json";
-        }
-        int len = snprintf(resp, sizeof(resp),
-                           "HTTP/1.1 200 OK\r\n"
-                           "Content-Length: %d\r\n"
-                           "Content-Type: %s\r\n"
-                           "Connection: close\r\n"
-                           "\r\n",
-                           body_len, ctype);
+        int resp_len = snprintf(resp, sizeof(resp),
+                                 "HTTP/1.1 200 OK\r\n"
+                                 "Content-Length: %d\r\n"
+                                 "Content-Type: %s\r\n"
+                                 "Connection: close\r\n"
+                                 "\r\n",
+                                 resp_body_len, ctype);
 
-        write(connfd, resp, len);
-
-        int sent = 0;
-        while (sent < body_len) {
-            int n = write(connfd, body + sent, body_len - sent);
-            if (n > 0) sent += n;
-            else break;
-        }
+        write(connfd, resp, resp_len);
+        write(connfd, resp_body, resp_body_len);
 
         close(connfd);
     }
