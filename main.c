@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <time.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 
@@ -75,6 +76,35 @@ void log_access(int connfd, const char *method, const char *path, const char *pr
     }
     printf("[%s] \033[32m%s\033[0m - %s \033[36m%s\033[0m %s\n", time_str, ip, method, path, proto);
     fflush(stdout);
+}
+
+void send_chunk(int connfd, const char *data, int len) {
+    if (len <= 0) return;
+    char chunk_header[32];
+    int header_len = snprintf(chunk_header, sizeof(chunk_header), "%x\r\n", len);
+    write(connfd, chunk_header, header_len);
+    write(connfd, data, len);
+    write(connfd, "\r\n", 2);
+}
+
+void send_chunk_end(int connfd) {
+    write(connfd, "0\r\n\r\n", 5);
+}
+
+void handle_time_chunked(int connfd) {
+    for (int i = 0; i < 10; i++) {
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        char time_buf[128];
+
+        int len = snprintf(time_buf, sizeof(time_buf),
+                           "<div>Current Server Time: %04d-%02d-%02d %02d:%02d:%02d</div>\n",
+                           tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+                           tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+
+        send_chunk(connfd, time_buf, len);
+        sleep(1);
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -212,46 +242,76 @@ int main(int argc, char *argv[]) {
         if (host_header && host_header[0]) {
             snprintf(local_host, sizeof(local_host), "%s", host_header);
         }
+        if (path_match(path, "/time")) {
+            // Chunked Response Path
+            const char *header =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/html; charset=utf-8\r\n"
+                "Transfer-Encoding: chunked\r\n"
+                "X-Content-Type-Options: nosniff\r\n"
+                "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+                "Connection: close\r\n"
+                "\r\n";
+            write(connfd, header, strlen(header));
 
-        char resp_body[BUF_SIZE];
-        int resp_body_len = 0;
-        const char *ctype = "text/plain";
-
-        if (path_match(path, "/get")) {
-            resp_body_len = build_httpbin(method, path, headers, header_count, resp_body, sizeof(resp_body), ip, local_host);
-            ctype = "application/json";
-        } else if (path_match(path, "/post")) {
-            resp_body_len = build_httpbin_post(method, path, headers, header_count, body, body_len, resp_body, sizeof(resp_body), ip, local_host);
-            ctype = "application/json";
-        } else if (path_match(path, "/raw")) {
-            resp_body_len = snprintf(resp_body, sizeof(resp_body), "%s %s %s\n", method, path, proto);
-            for (int i = 0; i < header_count; i++) {
-                resp_body_len += snprintf(resp_body + resp_body_len, sizeof(resp_body) - resp_body_len, "%s\n", headers[i]);
-            }
-        } else if (strcmp(path, "/") == 0) {
-            resp_body_len = snprintf(resp_body, sizeof(resp_body), "{}\n");
-        } else if (strncmp(path, "/exec/", 6) == 0) {
-            resp_body_len = handle_exec(path, method, proto, headers, header_count, body, body_len, resp_body, sizeof(resp_body));
+            handle_time_chunked(connfd);
+            send_chunk_end(connfd);
+            close(connfd);
+            exit(0);
         } else {
-            resp_body_len = snprintf(resp_body, sizeof(resp_body), "Not Found\n");
+            char resp_body[BUF_SIZE];
+            int resp_body_len = 0;
+            const char *ctype = "text/plain";
+
+            if (path_match(path, "/get")) {
+                resp_body_len = build_httpbin(method, path, headers, header_count, resp_body, sizeof(resp_body), ip, local_host);
+                ctype = "application/json";
+            } else if (path_match(path, "/post")) {
+                resp_body_len = build_httpbin_post(method, path, headers, header_count, body, body_len, resp_body, sizeof(resp_body), ip, local_host);
+                ctype = "application/json";
+            } else if (path_match(path, "/raw")) {
+                resp_body_len = snprintf(resp_body, sizeof(resp_body), "%s %s %s\n", method, path, proto);
+                for (int i = 0; i < header_count; i++) {
+                    resp_body_len += snprintf(resp_body + resp_body_len, sizeof(resp_body) - resp_body_len, "%s\n", headers[i]);
+                }
+            } else if (strcmp(path, "/") == 0) {
+                resp_body_len = snprintf(resp_body, sizeof(resp_body), "{}\n");
+            } else if (strncmp(path, "/exec/", 6) == 0) {
+                resp_body_len = handle_exec(path, method, proto, headers, header_count, body, body_len, resp_body, sizeof(resp_body));
+            } else if (strncmp(path, "/dir", 4) == 0) {
+                resp_body_len = handle_static(path, resp_body, sizeof(resp_body), &ctype);
+            } else if (strncmp(path, "/status/", 8) == 0) {
+                handle_status(path, connfd);
+                close(connfd);
+                exit(0);
+            } else if (strcmp(path, "/favicon.ico") == 0) {
+                const char *resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+                write(connfd, resp, strlen(resp));
+                close(connfd);
+                exit(0);
+            } else {
+                resp_body_len = snprintf(resp_body, sizeof(resp_body), "%s %s %s\n", method, path, proto);
+                for (int i = 0; i < header_count; i++) {
+                    resp_body_len += snprintf(resp_body + resp_body_len, sizeof(resp_body) - resp_body_len, "%s\n", headers[i]);
+                }
+            }
+
+            if (resp_body_len < 0) resp_body_len = 0;
+            if (resp_body_len > BUF_SIZE) resp_body_len = BUF_SIZE;
+
+            char resp[BUF_SIZE];
+            int resp_len = snprintf(resp, sizeof(resp),
+                                     "HTTP/1.1 200 OK\r\n"
+                                     "Content-Length: %d\r\n"
+                                     "Content-Type: %s\r\n"
+                                     "Connection: close\r\n"
+                                     "\r\n",
+                                     resp_body_len, ctype);
+
+            write(connfd, resp, resp_len);
+            write(connfd, resp_body, resp_body_len);
+            close(connfd);
+            exit(0);
         }
-
-        if (resp_body_len < 0) resp_body_len = 0;
-        if (resp_body_len > BUF_SIZE) resp_body_len = BUF_SIZE;
-
-        char resp[BUF_SIZE];
-        int resp_len = snprintf(resp, sizeof(resp),
-                                 "HTTP/1.1 200 OK\r\n"
-                                 "Content-Length: %d\r\n"
-                                 "Content-Type: %s\r\n"
-                                 "Connection: close\r\n"
-                                 "\r\n",
-                                 resp_body_len, ctype);
-
-        write(connfd, resp, resp_len);
-        write(connfd, resp_body, resp_body_len);
-
-        close(connfd);
-		exit(0);
     }
 }

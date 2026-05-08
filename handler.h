@@ -25,4 +25,8 @@ int handle_exec(const char *path, const char *method, const char *proto,
                const char *body, int body_len,
                char *body_out, int maxlen);
 
+const char *get_mime_type(const char *path);
+int handle_static(const char *uri, char *body, int maxlen, const char **ctype);
+int handle_status(const char *path, int connfd);
+
 #endif
