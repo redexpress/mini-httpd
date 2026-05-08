@@ -5,23 +5,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 
 #include "common.h"
-/*
-#define PORT 8080
-#define BUF_SIZE 16384
-#define MAX_HEADERS 64
-#define MAX_HEADER_LEN 1024
-
-typedef struct {
-    char buf[BUF_SIZE];
-    int start;
-    int end;
-} stream_buf_t;
-*/
 #include "handler.h"
 
 static int fill_buf(int sock, stream_buf_t *stream_buf) {
@@ -68,6 +57,26 @@ static const char *get_host_header(char headers[][MAX_HEADER_LEN], int header_co
     return "localhost";
 }
 
+static void send_400(int connfd) {
+    const char *resp = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+    write(connfd, resp, strlen(resp));
+}
+
+void log_access(int connfd, const char *method, const char *path, const char *proto) {
+    time_t now = time(NULL);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    char ip[64] = "unknown";
+    if (getpeername(connfd, (struct sockaddr *) &addr, &addr_len) == 0) {
+        inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+    }
+    printf("[%s] \033[32m%s\033[0m - %s \033[36m%s\033[0m %s\n", time_str, ip, method, path, proto);
+    fflush(stdout);
+}
+
 int main(int argc, char *argv[]) {
     int port = PORT;
 
@@ -75,11 +84,12 @@ int main(int argc, char *argv[]) {
         port = atoi(argv[1]);
     }
 
+    signal(SIGPIPE, SIG_IGN);  // Ignore this to prevent the server from crashing if it writes to a closed socket.
+    signal(SIGCHLD, SIG_IGN);  // Set to SIG_IGN so the kernel automatically reaps child processes, preventing "zombie" processes without needing explicit waitpid() calls.
+
     int listenfd, connfd;
     struct sockaddr_in servaddr;
-    stream_buf_t stream_buf;
-    stream_buf.start = 0;
-    stream_buf.end = 0;
+
     listenfd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -88,18 +98,33 @@ int main(int argc, char *argv[]) {
     servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
     servaddr.sin_port = htons(port);
     if (bind(listenfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) < 0) {
-        perror("bind");
+        perror("bind failed");
         exit(1);
     }
     if (listen(listenfd, 128) < 0) {
-        perror("listen");
+        perror("listen failed");
         exit(1);
     }
     printf("server running on %d\n", port);
     while (true) {
         connfd = accept(listenfd, NULL, NULL);
-        if (connfd < 0) continue;
+        if (connfd < 0) {
+            if (errno == EINTR) continue; // Retry immediately if interrupted by a signal (e.g., SIGCHLD)
+            continue;                     // Skip current iteration for other system errors (e.g., EMFILE). kept separate for future extensibility
+        }
 
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            perror("fork failed");
+            close(connfd);
+            continue;
+        }
+        if (pid > 0) {
+            close(connfd);
+            continue;
+        }
+        close(listenfd);
         stream_buf_t stream_buf;
         stream_buf.start = 0;
         stream_buf.end = 0;
@@ -107,13 +132,14 @@ int main(int argc, char *argv[]) {
         char req_line[MAX_HEADER_LEN];
         int n = get_line(connfd, &stream_buf, req_line, sizeof(req_line));
         if (n <= 0) {
+            send_400(connfd);
             close(connfd);
-            continue;
+            exit(0);
         }
 
-        // method and path
         char method[32] = {0}, path[1024] = {0}, proto[32] = {0};
         sscanf(req_line, "%31s %1023s %31s", method, path, proto);
+        log_access(connfd, method, path, proto);
 
         // header
         char headers[MAX_HEADERS][MAX_HEADER_LEN];
@@ -154,8 +180,7 @@ int main(int argc, char *argv[]) {
         if (content_length > 0 && content_length < BUF_SIZE) {
             int remain = stream_buf.end - stream_buf.start;
             if (remain > 0) {
-                int copy = remain;
-                if (copy > content_length) copy = content_length;
+                int copy = (remain > content_length) ? content_length : remain;
                 memcpy(body, stream_buf.buf + stream_buf.start, copy);
                 stream_buf.start += copy;
                 body_len += copy;
@@ -164,7 +189,10 @@ int main(int argc, char *argv[]) {
                 n = read(connfd, body + body_len, content_length - body_len);
                 if (n > 0) {
                     body_len += n;
+                } else if (n == 0) {
+                    break;
                 } else {
+                    if (errno == EINTR) continue;
                     break;
                 }
             }
@@ -183,16 +211,6 @@ int main(int argc, char *argv[]) {
         char local_host[256] = "localhost";
         if (host_header && host_header[0]) {
             snprintf(local_host, sizeof(local_host), "%s", host_header);
-        } else {
-            struct sockaddr_in local_addr;
-            socklen_t local_len = sizeof(local_addr);
-            if (getsockname(connfd, (struct sockaddr *) &local_addr, &local_len) == 0) {
-                char *p = local_host;
-                int len = 0;
-                inet_ntop(AF_INET, &local_addr.sin_addr, p, 256 - len);
-                len = strlen(p);
-                snprintf(p + len, 256 - len, ":%d", ntohs(local_addr.sin_port));
-            }
         }
 
         char resp_body[BUF_SIZE];
@@ -234,5 +252,6 @@ int main(int argc, char *argv[]) {
         write(connfd, resp_body, resp_body_len);
 
         close(connfd);
+		exit(0);
     }
 }
